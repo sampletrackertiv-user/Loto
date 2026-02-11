@@ -1,9 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { TicketData } from '../types';
+import React, { useState, useEffect, useRef } from 'react';
+import { TicketData, NetworkPayload, ChatMessage } from '../types';
 import { TicketView } from './TicketView';
 import { ChatOverlay } from './ChatOverlay';
-import { Volume2, VolumeX, Trophy, AlertTriangle } from 'lucide-react';
-import { generateLotoRhyme } from '../services/geminiService';
+import { Volume2, VolumeX, Trophy, Link, Loader } from 'lucide-react';
+import Peer, { DataConnection } from 'peerjs';
 
 interface GamePlayerProps {
   onExit: () => void;
@@ -11,8 +11,6 @@ interface GamePlayerProps {
 }
 
 // Generate a valid 9x3 Vietnamese Loto Ticket
-// Rule: 9 columns. Row 1: 5 nums, Row 2: 5 nums, Row 3: 5 nums.
-// Col 0: 1-9, Col 1: 10-19, ... Col 8: 80-90.
 const generateTicket = (): TicketData => {
   const ticket: TicketData = Array(3).fill(null).map(() => Array(9).fill({ value: null, marked: false }));
   const colRanges = [
@@ -21,26 +19,17 @@ const generateTicket = (): TicketData => {
     { min: 60, max: 69 }, { min: 70, max: 79 }, { min: 80, max: 90 }
   ];
 
-  // Logic to ensure 5 numbers per row and validity is complex. 
-  // Simplified robust generation:
-  // 1. Fill each column with some numbers.
-  // 2. Redistribute to ensure 5 per row.
-  // Simplified approximation for this demo:
-  
   for (let r = 0; r < 3; r++) {
-    // Pick 5 random columns for this row
     const availableCols = [0,1,2,3,4,5,6,7,8].sort(() => 0.5 - Math.random()).slice(0, 5);
     availableCols.forEach(c => {
       const range = colRanges[c];
       let num = Math.floor(Math.random() * (range.max - range.min + 1)) + range.min;
-      // Ensure unique in column across rows (simple check, good enough for demo)
       while (ticket[0][c].value === num || ticket[1][c].value === num) {
         num = Math.floor(Math.random() * (range.max - range.min + 1)) + range.min;
       }
       ticket[r][c] = { value: num, marked: false };
     });
   }
-  // Sort columns just in case
   for(let c=0; c<9; c++) {
       const numsInCol = [ticket[0][c].value, ticket[1][c].value, ticket[2][c].value].filter(n => n !== null) as number[];
       numsInCol.sort((a,b) => a-b);
@@ -52,71 +41,117 @@ const generateTicket = (): TicketData => {
           }
       }
   }
-
   return ticket;
 };
 
 export const GamePlayer: React.FC<GamePlayerProps> = ({ onExit, lang }) => {
+  // Connection State
+  const [roomId, setRoomId] = useState('');
+  const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [playerName, setPlayerName] = useState('');
+  const connRef = useRef<DataConnection | null>(null);
+
+  // Game State
   const [ticket, setTicket] = useState<TicketData>(generateTicket());
   const [history, setHistory] = useState<number[]>([]);
   const [currentCall, setCurrentCall] = useState<number | null>(null);
   const [currentRhyme, setCurrentRhyme] = useState<string>('');
   const [muted, setMuted] = useState(false);
   const [bingoStatus, setBingoStatus] = useState<'none' | 'check' | 'win'>('none');
-  
-  // Simulation of "Live" host calling numbers
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+
   useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
-    
-    // Start delay
-    const timeout = setTimeout(() => {
-       interval = setInterval(async () => {
-          // If already bingo, stop
-          if (bingoStatus === 'win') return;
-
-          const allNums = Array.from({ length: 90 }, (_, i) => i + 1);
-          const available = allNums.filter(n => !history.includes(n));
-          if (available.length === 0) return;
-
-          // Pick random number not in history (local simulation of server)
-          // In a real app, history would come from props/server
-          // Here we create a local simulation sequence that persists
-          let nextNum: number;
-          
-          // Cheat for demo: 10% chance to pick a number on the user's ticket if not marked
-          // so the user can actually play
-          const userUnmarked = ticket.flat().filter(c => c.value !== null && !c.marked).map(c => c.value as number);
-          
-          if (userUnmarked.length > 0 && Math.random() < 0.2) {
-             nextNum = userUnmarked[Math.floor(Math.random() * userUnmarked.length)];
-             // Ensure it hasn't been called (it shouldn't be if it's unmarked, but safety check)
-             if(history.includes(nextNum)) nextNum = available[Math.floor(Math.random() * available.length)];
-          } else {
-             nextNum = available[Math.floor(Math.random() * available.length)];
-          }
-
-          setHistory(prev => {
-              if (prev.includes(nextNum)) return prev;
-              return [...prev, nextNum];
-          });
-          setCurrentCall(nextNum);
-          
-          // Get rhyme
-          const rhyme = await generateLotoRhyme(nextNum, lang);
-          setCurrentRhyme(rhyme);
-
-       }, 5000); // New number every 5 seconds
-    }, 2000);
-
+    // Cleanup on unmount
     return () => {
-      clearTimeout(timeout);
-      clearInterval(interval);
+        if (connRef.current) connRef.current.close();
     };
-  }, [history, bingoStatus, lang, ticket]);
+  }, []);
 
-  // Handle cell click
+  const handleJoin = (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!roomId || !playerName) return;
+      
+      setIsConnecting(true);
+
+      const peer = new Peer();
+      peer.on('open', (id) => {
+          const conn = peer.connect(roomId);
+          connRef.current = conn;
+
+          conn.on('open', () => {
+              setIsConnected(true);
+              setIsConnecting(false);
+          });
+
+          conn.on('data', (data: any) => {
+              const action = data as NetworkPayload;
+              
+              switch (action.type) {
+                  case 'CALL_NUMBER':
+                      setCurrentCall(action.payload.number);
+                      setCurrentRhyme(action.payload.rhyme);
+                      setHistory(action.payload.history);
+                      break;
+                  case 'SYNC_STATE':
+                      setHistory(action.payload.history);
+                      setCurrentCall(action.payload.currentNumber);
+                      setCurrentRhyme(action.payload.currentRhyme);
+                      break;
+                  case 'CHAT_MESSAGE':
+                      setMessages(prev => [...prev, action.payload]);
+                      break;
+                  case 'RESET_GAME':
+                      setHistory([]);
+                      setCurrentCall(null);
+                      setCurrentRhyme('');
+                      setBingoStatus('none');
+                      setMessages([]);
+                      setTicket(generateTicket()); // New ticket for new game
+                      break;
+              }
+          });
+
+          conn.on('close', () => {
+              alert('Host disconnected');
+              setIsConnected(false);
+          });
+          
+          conn.on('error', (err) => {
+              console.error(err);
+              setIsConnecting(false);
+              alert('Connection failed. Check Room ID.');
+          });
+      });
+      
+      peer.on('error', (err) => {
+          console.error(err);
+          setIsConnecting(false);
+          alert('Could not connect to server.');
+      });
+  };
+
+  const handleSendMessage = (text: string) => {
+      if (!connRef.current || !isConnected) return;
+      
+      const msg: ChatMessage = {
+          id: Date.now().toString(),
+          sender: playerName,
+          text: text,
+          avatar: 'bg-indigo-600'
+      };
+      
+      // Optimistic update
+      setMessages(prev => [...prev, msg]);
+      
+      // Send to host
+      connRef.current.send({
+          type: 'CHAT_MESSAGE',
+          payload: msg
+      });
+  };
+
   const handleCellClick = (r: number, c: number, val: number) => {
-    // Only allow marking if the number has been called in history
     if (history.includes(val)) {
        const newTicket = [...ticket];
        newTicket[r] = [...newTicket[r]];
@@ -124,28 +159,68 @@ export const GamePlayer: React.FC<GamePlayerProps> = ({ onExit, lang }) => {
        setTicket(newTicket);
        checkWin(newTicket);
     } else {
-        // Visual feedback for invalid click?
         alert(lang === 'vi' ? 'Số này chưa gọi nha!' : 'Number not called yet!');
     }
   };
 
   const checkWin = (currentTicket: TicketData) => {
-    // Check Full House (all numbers marked) or Rows (traditional Loto often rewards full rows)
-    // Let's assume Full Row win for this demo
     for (const row of currentTicket) {
       const numbersInRow = row.filter(cell => cell.value !== null);
       if (numbersInRow.length > 0 && numbersInRow.every(cell => cell.marked)) {
         setBingoStatus('win');
         setCurrentRhyme("KINH! KINH! KINH! BINGO!!!");
+        // Optionally send 'I WON' to host here
         return;
       }
     }
-    // Check full house
     const allNumbers = currentTicket.flat().filter(c => c.value !== null);
     if (allNumbers.every(c => c.marked)) {
         setBingoStatus('win');
     }
   };
+
+  // Render Login Screen if not connected
+  if (!isConnected) {
+      return (
+          <div className="flex flex-col items-center justify-center min-h-screen bg-slate-900 p-4">
+              <div className="bg-slate-800 p-8 rounded-2xl shadow-2xl border border-slate-700 max-w-md w-full">
+                  <h2 className="text-2xl font-bold text-white mb-6 text-center">
+                      {lang === 'vi' ? 'Tham Gia Phòng Chơi' : 'Join Game Room'}
+                  </h2>
+                  <form onSubmit={handleJoin} className="space-y-4">
+                      <div>
+                          <label className="text-slate-400 text-sm mb-1 block">Your Name</label>
+                          <input 
+                              required
+                              className="w-full bg-slate-900 border border-slate-600 rounded-lg p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                              placeholder="Nickname..."
+                              value={playerName}
+                              onChange={e => setPlayerName(e.target.value)}
+                          />
+                      </div>
+                      <div>
+                          <label className="text-slate-400 text-sm mb-1 block">Room ID (From Host)</label>
+                          <input 
+                              required
+                              className="w-full bg-slate-900 border border-slate-600 rounded-lg p-3 text-white focus:ring-2 focus:ring-indigo-500 outline-none font-mono"
+                              placeholder="e.g. 5f3d-..."
+                              value={roomId}
+                              onChange={e => setRoomId(e.target.value)}
+                          />
+                      </div>
+                      <button 
+                          disabled={isConnecting}
+                          className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-4 rounded-xl transition-all flex justify-center items-center gap-2"
+                      >
+                          {isConnecting ? <Loader className="animate-spin"/> : <Link />}
+                          {isConnecting ? 'Connecting...' : (lang === 'vi' ? 'Vào Phòng' : 'Join Room')}
+                      </button>
+                      <button type="button" onClick={onExit} className="w-full text-slate-500 text-sm hover:text-white">Back</button>
+                  </form>
+              </div>
+          </div>
+      );
+  }
 
   return (
     <div className="flex flex-col h-screen bg-slate-900">
@@ -155,13 +230,9 @@ export const GamePlayer: React.FC<GamePlayerProps> = ({ onExit, lang }) => {
             <div className="bg-red-600 text-white font-bold px-3 py-1 rounded text-sm uppercase tracking-wider animate-pulse">
                 Live
             </div>
-            <h1 className="text-white font-bold hidden sm:block">Phòng: Tết Sum Vầy (#882)</h1>
+            <h1 className="text-white font-bold hidden sm:block">Room: {roomId.slice(0,6)}...</h1>
          </div>
          <div className="flex items-center gap-4">
-             <div className="text-right hidden sm:block">
-                <p className="text-xs text-slate-400">Giải thưởng / Jackpot</p>
-                <p className="text-yellow-400 font-bold">5,000,000 VNĐ</p>
-             </div>
              <button onClick={() => setMuted(!muted)} className="p-2 text-slate-400 hover:text-white rounded-full bg-slate-700">
                  {muted ? <VolumeX size={18} /> : <Volume2 size={18} />}
              </button>
@@ -175,11 +246,10 @@ export const GamePlayer: React.FC<GamePlayerProps> = ({ onExit, lang }) => {
             <div className="absolute inset-0 z-50 bg-black/80 flex items-center justify-center flex-col p-4">
                 <Trophy size={80} className="text-yellow-400 mb-4 animate-bounce" />
                 <h2 className="text-4xl md:text-6xl font-black text-white text-center mb-4 text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 via-red-500 to-pink-500">
-                    BINGO! CHIẾN THẮNG!
+                    BINGO!
                 </h2>
-                <p className="text-white text-xl mb-8">Bạn đã thắng giải nhất!</p>
                 <button onClick={onExit} className="bg-white text-red-600 px-8 py-3 rounded-full font-bold hover:bg-gray-100">
-                    Nhận Thưởng & Thoát
+                    Exit
                 </button>
             </div>
          )}
@@ -236,7 +306,11 @@ export const GamePlayer: React.FC<GamePlayerProps> = ({ onExit, lang }) => {
 
          {/* Right: Chat */}
          <div className="h-64 md:h-full md:w-80 p-2 shrink-0">
-             <ChatOverlay gameHistory={history} playerName="Me" />
+             <ChatOverlay 
+                messages={messages} 
+                onSendMessage={handleSendMessage}
+                playerName={playerName} 
+             />
          </div>
       </div>
     </div>

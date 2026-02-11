@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, Pause, RotateCcw, Volume2, Share2, Mic } from 'lucide-react';
+import { Play, Pause, RotateCcw, Volume2, Share2, Mic, Copy, Users } from 'lucide-react';
 import { generateLotoRhyme } from '../services/geminiService';
-import { Language } from '../types';
+import { Language, NetworkPayload, ChatMessage } from '../types';
+import Peer, { DataConnection } from 'peerjs';
 
 interface GameHostProps {
   onExit: () => void;
@@ -9,50 +10,157 @@ interface GameHostProps {
 }
 
 export const GameHost: React.FC<GameHostProps> = ({ onExit, lang }) => {
+  // Game State
   const [calledNumbers, setCalledNumbers] = useState<number[]>([]);
   const [currentNumber, setCurrentNumber] = useState<number | null>(null);
   const [currentRhyme, setCurrentRhyme] = useState<string>('');
   const [isAuto, setIsAuto] = useState(false);
   const [speed, setSpeed] = useState(6000);
-  const [flash, setFlash] = useState(false); // Visual effect for new number
+  const [flash, setFlash] = useState(false);
+  
+  // Network State
+  const [peerId, setPeerId] = useState<string>('');
+  const [connections, setConnections] = useState<DataConnection[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const peerRef = useRef<Peer | null>(null);
 
-  // Use refs for interval management to avoid closure staleness
+  // Refs for logic
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const numbersRef = useRef<number[]>([]); // To track available numbers synchronously
+  const connectionsRef = useRef<DataConnection[]>([]); // Synced ref for callbacks
 
+  // Initialize PeerJS (Host)
   useEffect(() => {
-    // Initial rhyme welcome
-    setCurrentRhyme(lang === 'vi' ? "Mời bà con cô bác cùng tham gia..." : "Welcome everyone, get your tickets ready...");
-    return () => stopAuto();
-  }, [lang]);
+    // Generate a shorter, friendlier ID if possible, but standard peerjs IDs are UUIDs.
+    // We will let PeerJS assign one for reliability.
+    const peer = new Peer();
+    peerRef.current = peer;
 
+    peer.on('open', (id) => {
+      setPeerId(id);
+      setCurrentRhyme(lang === 'vi' ? "Phòng đã sẵn sàng! Mời mọi người vào." : "Room Ready! Waiting for players.");
+    });
+
+    peer.on('connection', (conn) => {
+      conn.on('open', () => {
+        connectionsRef.current.push(conn);
+        setConnections([...connectionsRef.current]);
+        
+        // Send initial sync to new player
+        const syncData: NetworkPayload = {
+          type: 'SYNC_STATE',
+          payload: {
+             history: calledNumbers, // Need to access current state, might need ref if using inside closure
+             currentNumber,
+             currentRhyme
+          }
+        };
+        // We need to send the LATEST state. 
+        // Since this callback is a closure, we might miss state updates.
+        // For simplicity in this demo, the Player requests sync or we trigger it later.
+        // Better: Just send what we know immediately, but React state might be stale here.
+        // Let's rely on the next broadcast or send a quick "Welcome"
+        
+        broadcast({
+            type: 'CHAT_MESSAGE',
+            payload: {
+                id: Date.now().toString(),
+                sender: 'System',
+                text: 'New player joined!',
+                isSystem: true
+            }
+        });
+      });
+
+      conn.on('data', (data: any) => {
+        const action = data as NetworkPayload;
+        if (action.type === 'CHAT_MESSAGE') {
+            const msg = action.payload as ChatMessage;
+            setMessages(prev => [...prev, msg]);
+            // Re-broadcast chat to everyone else
+            broadcast(action);
+        }
+      });
+
+      conn.on('close', () => {
+         connectionsRef.current = connectionsRef.current.filter(c => c !== conn);
+         setConnections([...connectionsRef.current]);
+      });
+    });
+
+    return () => {
+      peer.destroy();
+    };
+  }, []);
+
+  // Ensure state is synced when a player connects (using a side effect for simplicity)
+  useEffect(() => {
+      if (connections.length > 0) {
+        // Send Sync to everyone to be safe, or just newest.
+        // This is a bit spammy but ensures consistency.
+        const syncData: NetworkPayload = {
+            type: 'SYNC_STATE',
+            payload: {
+                history: calledNumbers,
+                currentNumber,
+                currentRhyme
+            }
+        };
+        broadcast(syncData);
+      }
+  }, [connections.length]); // Only when connection count changes
+
+  const broadcast = (data: NetworkPayload) => {
+    connectionsRef.current.forEach(conn => {
+        if (conn.open) conn.send(data);
+    });
+    
+    // Also update local state if it's chat
+    if (data.type === 'CHAT_MESSAGE') {
+        // Handled separately or checked here
+    }
+  };
+
+  // Game Logic
   const drawNumber = async () => {
     const allNumbers = Array.from({ length: 90 }, (_, i) => i + 1);
     const available = allNumbers.filter(n => !calledNumbers.includes(n));
 
     if (available.length === 0) {
       stopAuto();
-      setCurrentRhyme(lang === 'vi' ? "Hết số rồi! Kiểm tra vé nào!" : "All numbers called! Check for Bingo!");
+      const endMsg = lang === 'vi' ? "Hết số rồi!" : "Game Over!";
+      setCurrentRhyme(endMsg);
+      broadcast({ type: 'CALL_NUMBER', payload: { number: null, rhyme: endMsg, history: calledNumbers } });
       return;
     }
 
     const nextNum = available[Math.floor(Math.random() * available.length)];
     
-    // Optimistic UI update
+    // Update Local
     setFlash(true);
     setCurrentNumber(nextNum);
-    setCalledNumbers(prev => [...prev, nextNum]);
+    const newHistory = [...calledNumbers, nextNum];
+    setCalledNumbers(newHistory);
     setTimeout(() => setFlash(false), 500);
 
-    // Fetch Rhyme
+    // AI Rhyme
     const rhyme = await generateLotoRhyme(nextNum, lang);
     setCurrentRhyme(rhyme);
+
+    // Broadcast
+    broadcast({
+        type: 'CALL_NUMBER',
+        payload: {
+            number: nextNum,
+            rhyme: rhyme,
+            history: newHistory
+        }
+    });
   };
 
   const startAuto = () => {
     if (isAuto) return;
     setIsAuto(true);
-    drawNumber(); // Draw immediately
+    drawNumber();
     timerRef.current = setInterval(drawNumber, speed);
   };
 
@@ -70,7 +178,14 @@ export const GameHost: React.FC<GameHostProps> = ({ onExit, lang }) => {
     stopAuto();
     setCalledNumbers([]);
     setCurrentNumber(null);
-    setCurrentRhyme(lang === 'vi' ? "Bắt đầu ván mới nào!" : "New game starting!");
+    setCurrentRhyme(lang === 'vi' ? "Ván mới!" : "New Game!");
+    setMessages([]);
+    broadcast({ type: 'RESET_GAME', payload: {} });
+  };
+
+  const copyToClipboard = () => {
+    navigator.clipboard.writeText(peerId);
+    alert('Room ID copied!');
   };
 
   return (
@@ -78,7 +193,7 @@ export const GameHost: React.FC<GameHostProps> = ({ onExit, lang }) => {
       {/* Header */}
       <header className="p-4 bg-slate-900 border-b border-slate-700 flex justify-between items-center shrink-0">
         <h1 className="text-xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 to-red-500">
-          Loto Master <span className="text-xs text-slate-400 font-normal border border-slate-600 px-2 py-0.5 rounded ml-2">HOST MODE</span>
+          Loto Master <span className="text-xs text-slate-400 font-normal border border-slate-600 px-2 py-0.5 rounded ml-2">HOST</span>
         </h1>
         <div className="flex gap-2">
            <button onClick={resetGame} className="p-2 hover:bg-slate-800 rounded text-slate-300" title="Reset">
@@ -93,7 +208,18 @@ export const GameHost: React.FC<GameHostProps> = ({ onExit, lang }) => {
       <main className="flex-1 overflow-hidden flex flex-col md:flex-row">
         {/* Left Panel: The Stage */}
         <section className="flex-1 p-6 flex flex-col items-center justify-center relative bg-slate-900">
-           {/* Background effects */}
+           {/* Room Info Overlay */}
+           <div className="absolute top-4 left-4 bg-black/50 backdrop-blur px-4 py-2 rounded-lg border border-white/10 z-20">
+              <div className="text-xs text-slate-400 uppercase font-bold mb-1">Room ID</div>
+              <div className="flex items-center gap-2">
+                  <code className="text-green-400 font-mono text-lg">{peerId || 'Connecting...'}</code>
+                  <button onClick={copyToClipboard} className="text-white hover:text-green-300"><Copy size={16}/></button>
+              </div>
+              <div className="text-xs text-slate-500 mt-1 flex items-center gap-1">
+                 <Users size={12}/> {connections.length} players connected
+              </div>
+           </div>
+
            <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-indigo-900/20 via-slate-900 to-slate-900 z-0"></div>
 
            <div className="z-10 w-full max-w-md text-center space-y-8">
@@ -163,7 +289,6 @@ export const GameHost: React.FC<GameHostProps> = ({ onExit, lang }) => {
         <section className="md:w-96 bg-slate-800 border-l border-slate-700 flex flex-col">
           <div className="p-4 border-b border-slate-700 font-semibold text-slate-300 flex justify-between">
             <span>Board ({calledNumbers.length}/90)</span>
-            <button className="text-slate-500 hover:text-white"><Share2 size={18} /></button>
           </div>
           <div className="flex-1 p-2 overflow-y-auto">
              <div className="grid grid-cols-5 gap-2">

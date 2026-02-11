@@ -35,3 +35,11 @@ export interface GameState {
   gameSpeed: number; // ms
   totalBalls: number; // 90 usually
 }
+
+// Networking Types
+export type NetworkActionType = 'SYNC_STATE' | 'CALL_NUMBER' | 'CHAT_MESSAGE' | 'RESET_GAME' | 'PLAYER_JOINED';
+
+export interface NetworkPayload {
+  type: NetworkActionType;
+  payload: any;
+}
